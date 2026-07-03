@@ -88,7 +88,6 @@ jobs:
       - name: Setup GitHub CLI
         run: |
           which gh || sudo apt-get install -y gh
-          gh auth setup-git
 
       - name: Download YouTube Video(s)
         env:
@@ -530,6 +529,8 @@ jobs:
           docker rm warp || true
 
       - name: Upload to GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           REPO_OWNER=${{ github.repository_owner }}
           REPO_NAME=${{ github.repository.name }}
