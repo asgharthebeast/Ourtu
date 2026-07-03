@@ -546,10 +546,6 @@ jobs:
           TAG="yt-$(date +%Y%m%d-%H%M%S)"
           echo "Creating release: $TAG"
 
-          # Initialize git repo for gh CLI
-          git init
-          git remote add origin "https://github.com/${REPO_OWNER}/${REPO_NAME}"
-
           # Create release
           RELEASE_TITLE="YouTube Download $(date '+%Y-%m-%d %H:%M')"
 
