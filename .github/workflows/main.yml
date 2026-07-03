@@ -177,7 +177,8 @@ jobs:
             echo "${args[@]}"
           }
 
-          # Download video with 8 bypass methods
+          # Download video with 8 bypass methods, returns 0 on success
+          # Stores achieved height in /tmp/achieved_height.txt
           download_video() {
             local url="$1"
             local tmp_dir="$2"
@@ -188,6 +189,8 @@ jobs:
 
             local ua_chrome="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
             local ua_android="Mozilla/5.0 (Linux; Android 12; SM-S906N Build/QP1A.190711.020) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36"
+
+            local best_height=0
 
             for method in {1..8}; do
               echo "Trying download method $method..."
@@ -327,14 +330,76 @@ jobs:
                   ;;
               esac
 
+              # Try download
               if "${cmd_args[@]}"; then
-                echo "Download successful with method $method!"
-                return 0
+                # Download succeeded, now validate quality
+                local downloaded_file=""
+                for f in "$tmp_dir"/*.mp4 "$tmp_dir"/*.mkv "$tmp_dir"/*.webm "$tmp_dir"/*.mp3; do
+                  [ -f "$f" ] && downloaded_file="$f" && break
+                done
+
+                if [ -n "$downloaded_file" ]; then
+                  # Clean up partial files
+                  rm -f "$tmp_dir"/*.part
+
+                  if [ "$quality" = "audio" ]; then
+                    # Audio: accept any download
+                    echo "Download successful with method $method!"
+                    echo "0" > /tmp/achieved_height.txt
+                    return 0
+                  fi
+
+                  local height=$(get_video_height "$downloaded_file")
+                  if [ -n "$height" ] && [ "$height" -gt 0 ]; then
+                    echo "Method $method delivered ${height}p"
+
+                    if [ "$quality" = "best" ]; then
+                      # For "best": keep trying for higher quality, but accept >=720p
+                      if [ "$height" -gt "$best_height" ]; then
+                        best_height=$height
+                      fi
+                      if [ "$height" -ge 720 ] || [ "$method" -eq 8 ]; then
+                        # Accept if >=720p or if this is the last method
+                        echo "Download successful with method $method! (${height}p)"
+                        echo "$height" > /tmp/achieved_height.txt
+                        return 0
+                      else
+                        echo "Method $method delivered ${height}p — trying next for better quality..."
+                        rm -f "$tmp_dir"/*.mp4 "$tmp_dir"/*.mkv "$tmp_dir"/*.webm
+                      fi
+                    else
+                      # For specific quality (1080, 720, etc.): accept if within 150p tolerance
+                      local target=$quality
+                      if [ "$height" -ge $((target - 150)) ] || [ "$method" -eq 8 ]; then
+                        echo "Download successful with method $method! (${height}p)"
+                        echo "$height" > /tmp/achieved_height.txt
+                        return 0
+                      else
+                        echo "Method $method delivered ${height}p instead of ${target}p — rejecting..."
+                        rm -f "$tmp_dir"/*.mp4 "$tmp_dir"/*.mkv "$tmp_dir"/*.webm
+                      fi
+                    fi
+                  else
+                    # Couldn't determine height, accept the download
+                    echo "Download successful with method $method! (height unknown)"
+                    echo "0" > /tmp/achieved_height.txt
+                    return 0
+                  fi
+                fi
               fi
+
               echo "Method $method failed, waiting 3 seconds..."
               sleep 3
             done
+
+            echo "All download methods failed"
             return 1
+          }
+
+          # Get video height using ffprobe
+          get_video_height() {
+            local filepath="$1"
+            ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$filepath" 2>/dev/null | head -1
           }
 
           # Sanitize filename
@@ -454,8 +519,9 @@ jobs:
                 video_name=$(sanitize_name "$(basename "$video_file" | sed 's/\.[^.]*$//')")
                 video_ext="${video_file##*.}"
                 video_size=$(stat -c%s "$video_file")
+                achieved_height=$(cat /tmp/achieved_height.txt 2>/dev/null || echo "0")
 
-                echo "Video: $video_name.$video_ext ($(( video_size / 1048576 )) MB)"
+                echo "Video: $video_name.$video_ext ($(( video_size / 1048576 )) MB, ${achieved_height}p)"
 
                 # Create unique folder
                 FOLDER_NAME="$video_name"
@@ -488,8 +554,8 @@ jobs:
                   cp "$video_file" "$BACKUP_DIR/$FOLDER_NAME/$FOLDER_NAME.$video_ext"
                 fi
 
-                # Write video info
-                echo "$video_name|$FOLDER_NAME" >> "$VIDEO_INFO_FILE"
+                # Write video info (name|folder|height)
+                echo "$video_name|$FOLDER_NAME|$achieved_height" >> "$VIDEO_INFO_FILE"
 
                 # Download subtitles if enabled
                 if [ "$DOWNLOAD_SUBS" = "true" ]; then
@@ -546,9 +612,13 @@ jobs:
           NOTES="## Downloaded Videos\n\n"
           NUM=0
           if [ -f "$VIDEO_INFO" ]; then
-            while IFS='|' read -r ORIG_NAME FOLDER_NAME; do
+            while IFS='|' read -r ORIG_NAME FOLDER_NAME V_HEIGHT; do
               NUM=$((NUM + 1))
-              NOTES="${NOTES}${NUM}. ${ORIG_NAME}\n"
+              if [ "$V_HEIGHT" -gt 0 ] 2>/dev/null; then
+                NOTES="${NOTES}${NUM}. ${ORIG_NAME} (${V_HEIGHT}p)\n"
+              else
+                NOTES="${NOTES}${NUM}. ${ORIG_NAME}\n"
+              fi
               if [ -f "$BACKUP_DIR/$FOLDER_NAME/${ORIG_NAME}_subs.zip" ]; then
                 NOTES="${NOTES}   - Subtitles: ✅\n"
               else
