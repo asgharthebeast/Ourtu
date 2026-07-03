@@ -99,8 +99,6 @@ jobs:
           REPO_NAME_ENV: ${{ github.repository.name }}
           BRANCH_ENV: ${{ github.ref_name }}
         run: |
-          set -e
-
           # Parse input URLs
           URLS_RAW="$YT_URLS"
           read -ra URL_LIST <<< "$URLS_RAW"
@@ -110,7 +108,13 @@ jobs:
             local url="$1"
             if [[ "$url" == *"playlist"* ]] || [[ "$url" == *"list="* ]]; then
               echo "Playlist detected: $url" >&2
-              yt-dlp --flat-playlist --print url --no-warnings "$url" 2>/dev/null
+              local expanded=$(yt-dlp --flat-playlist --print url --no-warnings "$url" 2>/dev/null)
+              if [ -n "$expanded" ]; then
+                echo "$expanded"
+              else
+                echo "Playlist extraction failed, treating as single video" >&2
+                echo "$url"
+              fi
             else
               echo "$url"
             fi
@@ -333,20 +337,9 @@ jobs:
             return 1
           }
 
-          # Get video height using ffprobe
-          get_video_height() {
-            local filepath="$1"
-            ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$filepath" 2>/dev/null | head -1
-          }
-
           # Sanitize filename
           sanitize_name() {
             echo "$1" | tr ' ' '-' | tr '　' '-' | sed 's/--*/-/g'
-          }
-
-          # URL encode
-          urlencode() {
-            python3 -c "import urllib.parse; print(urllib.parse.quote('$1', safe=''))"
           }
 
           # Generate random suffix
@@ -461,7 +454,6 @@ jobs:
                 video_name=$(sanitize_name "$(basename "$video_file" | sed 's/\.[^.]*$//')")
                 video_ext="${video_file##*.}"
                 video_size=$(stat -c%s "$video_file")
-                video_height=$(get_video_height "$video_file")
 
                 echo "Video: $video_name.$video_ext ($(( video_size / 1048576 )) MB)"
 
@@ -473,13 +465,14 @@ jobs:
 
                 mkdir -p "$BACKUP_DIR/$FOLDER_NAME"
 
-                # Copy thumbnail
-                if ls "$TMP_DIR"/*.jpg 2>/dev/null | head -1 > /dev/null; then
-                  cp "$TMP_DIR"/*.jpg "$BACKUP_DIR/$FOLDER_NAME/thumbnail.jpg" 2>/dev/null || true
+                # Copy thumbnail (first jpg only)
+                thumb=$(ls "$TMP_DIR"/*.jpg 2>/dev/null | head -1)
+                if [ -n "$thumb" ] && [ -f "$thumb" ]; then
+                  cp "$thumb" "$BACKUP_DIR/$FOLDER_NAME/thumbnail.jpg" 2>/dev/null || true
                 fi
 
-                # Handle large files (>2GB)
-                SPLIT_MB=95
+                # Handle large files (>2GB - GitHub Releases limit)
+                SPLIT_MB=2000
                 SPLIT_BYTES=$((SPLIT_MB * 1024 * 1024))
 
                 if [ "$video_size" -gt "$SPLIT_BYTES" ]; then
@@ -552,14 +545,12 @@ jobs:
           # Build release notes from video info
           NOTES="## Downloaded Videos\n\n"
           NUM=0
-          HAS_SUBS=false
           if [ -f "$VIDEO_INFO" ]; then
             while IFS='|' read -r ORIG_NAME FOLDER_NAME; do
               NUM=$((NUM + 1))
               NOTES="${NOTES}${NUM}. ${ORIG_NAME}\n"
               if [ -f "$BACKUP_DIR/$FOLDER_NAME/${ORIG_NAME}_subs.zip" ]; then
                 NOTES="${NOTES}   - Subtitles: ✅\n"
-                HAS_SUBS=true
               else
                 NOTES="${NOTES}   - Subtitles: ❌\n"
               fi
