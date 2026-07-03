@@ -1,0 +1,589 @@
+name: 01 - 🏆 دانلود از یوتیوب ( اصلی )
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_urls:
+        description: '🔗 لینک ویدیو ( چند لینک با فاصله )'
+        required: true
+        type: string
+      download_subtitles:
+        description: '📝 زیرنویس ( فارسی و انگلیسی )'
+        required: false
+        default: false
+        type: boolean
+      quality:
+        description: '🎬 کیفیت و نوع'
+        required: false
+        default: 'best'
+        type: choice
+        options:
+          - best
+          - 2160
+          - 1440
+          - 1080
+          - 720
+          - 480
+          - audio
+      password:
+        description: '🔒 رمز ( اختیاری برای محافظت )'
+        required: false
+        default: ''
+        type: string
+
+jobs:
+  get-video:
+    name: "📥 دانلود ویدیو"
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check URL provided
+        run: |
+          if [ -z "${{ github.event.inputs.video_urls }}" ]; then
+            echo "❌ No video URL provided!"
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Configure Git for Large Files
+        run: |
+          git config --global http.postBuffer 524288000
+          git config --global http.maxRequestBuffer 100M
+          git config --global core.compression 0
+          git config --global pack.windowMemory 256m
+          git config --global pack.packSizeLimit 100m
+          git config --global pack.threads 1
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+      - name: Start WARP Container
+        run: |
+          docker network create warp-net || true
+          docker run -d --name warp --restart=always --network warp-net -p 1080:1080 --cap-add NET_ADMIN --sysctl net.ipv6.conf.all.disable_ipv6=0 --sysctl net.ipv4.conf.all.src_valid_mark=1 -v warp-data:/var/lib/cloudflare-warp caomingjun/warp
+          sleep 15
+          for i in {1..5}; do
+            RESULT=$(curl -s --max-time 5 --socks5-hostname 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || echo "failed")
+            if echo "$RESULT" | grep -qE "warp=(on|plus)"; then echo "WARP is active!"; break; fi
+            sleep 5
+          done
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pip ffmpeg zip p7zip-full curl jq bc unzip rar
+          curl -fsSL https://deno.land/install.sh | sh
+          export DENO_INSTALL="$HOME/.deno"
+          export PATH="$DENO_INSTALL/bin:$PATH"
+          echo "$DENO_INSTALL/bin" >> $GITHUB_PATH
+          pip3 install --upgrade yt-dlp
+
+      - name: Setup GitHub CLI
+        run: |
+          which gh || sudo apt-get install -y gh
+          gh auth setup-git
+
+      - name: Download YouTube Video(s)
+        env:
+          YT_URLS: ${{ github.event.inputs.video_urls }}
+          YT_QUALITY: ${{ github.event.inputs.quality }}
+          YT_PASSWORD: ${{ github.event.inputs.password }}
+          DOWNLOAD_SUBS: ${{ github.event.inputs.download_subtitles }}
+          REPO_OWNER_ENV: ${{ github.repository_owner }}
+          REPO_NAME_ENV: ${{ github.repository.name }}
+          BRANCH_ENV: ${{ github.ref_name }}
+        run: |
+          set -e
+
+          # Parse input URLs
+          URLS_RAW="$YT_URLS"
+          read -ra URL_LIST <<< "$URLS_RAW"
+
+          # Expand playlists
+          expand_url() {
+            local url="$1"
+            if [[ "$url" == *"playlist"* ]] || [[ "$url" == *"list="* ]]; then
+              echo "Playlist detected: $url" >&2
+              yt-dlp --flat-playlist --print url --no-warnings "$url" 2>/dev/null
+            else
+              echo "$url"
+            fi
+          }
+
+          ALL_URLS=()
+          for url in "${URL_LIST[@]}"; do
+            while IFS= read -r video_url; do
+              [ -n "$video_url" ] && ALL_URLS+=("$video_url")
+            done < <(expand_url "$url")
+          done
+          echo "Total videos to download: ${#ALL_URLS[@]}"
+
+          # Quality format mapping
+          get_format() {
+            local quality="$1"
+            case "$quality" in
+              audio) echo "bestaudio/bestaudio*/best" ;;
+              best) echo "bv*+ba/b" ;;
+              2160) echo "bestvideo[height>=2000][height<=2160]+bestaudio/bestvideo[height<=2160]+bestaudio/best" ;;
+              1440) echo "bestvideo[height>=1400][height<=1440]+bestaudio/bestvideo[height<=1440]+bestaudio/best" ;;
+              1080) echo "bestvideo[height>=1000][height<=1080]+bestaudio/bestvideo[height<=1080]+bestaudio/best" ;;
+              720) echo "bestvideo[height>=700][height<=720]+bestaudio/bestvideo[height<=720]+bestaudio/best" ;;
+              480) echo "bestvideo[height>=450][height<=480]+bestaudio/bestvideo[height<=480]+bestaudio/best" ;;
+              *) echo "bv*+ba/b" ;;
+            esac
+          }
+
+          # Get common yt-dlp arguments
+          get_common_args() {
+            local quality="$1"
+            local tmp_dir="$2"
+            local args=(
+              "--write-thumbnail"
+              "--convert-thumbnails"
+              "jpg"
+              "--no-cache-dir"
+              "--output"
+              "${tmp_dir}/%(title)s.%(ext)s"
+              "--no-part"
+              "--retries"
+              "5"
+              "--fragment-retries"
+              "5"
+              "--no-check-certificates"
+              "--concurrent-fragments"
+              "8"
+              "--buffer-size"
+              "16K"
+              "--http-chunk-size"
+              "10M"
+              "--progress"
+              "--newline"
+            )
+            if [ "$quality" = "audio" ]; then
+              args+=("--extract-audio" "--audio-format" "mp3" "--audio-quality" "0")
+            else
+              args+=("--merge-output-format" "mp4")
+            fi
+            echo "${args[@]}"
+          }
+
+          # Download video with 8 bypass methods
+          download_video() {
+            local url="$1"
+            local tmp_dir="$2"
+            local fmt="$3"
+            local quality="$4"
+            local common_args
+            common_args=$(get_common_args "$quality" "$tmp_dir")
+
+            local ua_chrome="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            local ua_android="Mozilla/5.0 (Linux; Android 12; SM-S906N Build/QP1A.190711.020) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36"
+
+            for method in {1..8}; do
+              echo "Trying download method $method..."
+
+              local cmd_args=()
+              case $method in
+                1)
+                  cmd_args=(
+                    "yt-dlp"
+                    "--proxy" "socks5://127.0.0.1:1080"
+                    "--format" "$fmt"
+                  )
+                  if [ "$quality" != "audio" ]; then
+                    cmd_args+=("--format-sort" "res,vcodec:h264")
+                  fi
+                  cmd_args+=(
+                    $common_args
+                    "--extractor-args" "youtube:player_client=web"
+                    "--js-runtimes" "deno"
+                    "--remote-components" "ejs:github"
+                    "--user-agent" "$ua_chrome"
+                    "--add-header" "Accept-Language:en-US,en;q=0.9"
+                    "$url"
+                  )
+                  ;;
+                2)
+                  cmd_args=(
+                    "yt-dlp"
+                    "--proxy" "socks5://127.0.0.1:1080"
+                    "--format" "$fmt"
+                  )
+                  if [ "$quality" != "audio" ]; then
+                    cmd_args+=("--format-sort" "res,vcodec:h264")
+                  fi
+                  cmd_args+=(
+                    $common_args
+                    "--extractor-args" "youtube:player_client=web"
+                    "--js-runtimes" "deno"
+                    "--remote-components" "ejs:npm"
+                    "--user-agent" "$ua_chrome"
+                    "--add-header" "Accept-Language:en-US,en;q=0.9"
+                    "$url"
+                  )
+                  ;;
+                3)
+                  cmd_args=(
+                    "yt-dlp"
+                    "--proxy" "socks5://127.0.0.1:1080"
+                    "--format" "$fmt"
+                  )
+                  if [ "$quality" != "audio" ]; then
+                    cmd_args+=("--format-sort" "res,vcodec:h264")
+                  fi
+                  cmd_args+=(
+                    $common_args
+                    "--extractor-args" "youtube:player_client=web,mweb,android_vr"
+                    "--js-runtimes" "deno"
+                    "--remote-components" "ejs:github"
+                    "$url"
+                  )
+                  ;;
+                4)
+                  cmd_args=(
+                    "yt-dlp"
+                    "--proxy" "socks5://127.0.0.1:1080"
+                    "--format" "$fmt"
+                  )
+                  if [ "$quality" != "audio" ]; then
+                    cmd_args+=("--format-sort" "res,vcodec:h264")
+                  fi
+                  cmd_args+=(
+                    $common_args
+                    "--extractor-args" "youtube:player_client=mweb"
+                    "$url"
+                  )
+                  ;;
+                5)
+                  cmd_args=(
+                    "yt-dlp"
+                    "--proxy" "socks5://127.0.0.1:1080"
+                    "--format" "$fmt"
+                  )
+                  if [ "$quality" != "audio" ]; then
+                    cmd_args+=("--format-sort" "res,vcodec:h264")
+                  fi
+                  cmd_args+=(
+                    $common_args
+                    "--extractor-args" "youtube:player_client=android_vr"
+                    "$url"
+                  )
+                  ;;
+                6)
+                  cmd_args=(
+                    "yt-dlp"
+                    "--format" "$fmt"
+                  )
+                  if [ "$quality" != "audio" ]; then
+                    cmd_args+=("--format-sort" "res,vcodec:h264")
+                  fi
+                  cmd_args+=(
+                    $common_args
+                    "--extractor-args" "youtube:player_client=web"
+                    "--js-runtimes" "deno"
+                    "--remote-components" "ejs:github"
+                    "$url"
+                  )
+                  ;;
+                7)
+                  cmd_args=(
+                    "yt-dlp"
+                    "--format" "$fmt"
+                  )
+                  if [ "$quality" != "audio" ]; then
+                    cmd_args+=("--format-sort" "res,vcodec:h264")
+                  fi
+                  cmd_args+=(
+                    $common_args
+                    "--extractor-args" "youtube:player_client=mweb"
+                    "$url"
+                  )
+                  ;;
+                8)
+                  cmd_args=(
+                    "yt-dlp"
+                    "--proxy" "socks5://127.0.0.1:1080"
+                    "--format" "$fmt"
+                  )
+                  if [ "$quality" != "audio" ]; then
+                    cmd_args+=("--format-sort" "res,vcodec:h264")
+                  fi
+                  cmd_args+=(
+                    $common_args
+                    "--extractor-args" "youtube:player_client=android"
+                    "--user-agent" "$ua_android"
+                    "$url"
+                  )
+                  ;;
+              esac
+
+              if "${cmd_args[@]}"; then
+                echo "Download successful with method $method!"
+                return 0
+              fi
+              echo "Method $method failed, waiting 3 seconds..."
+              sleep 3
+            done
+            return 1
+          }
+
+          # Get video height using ffprobe
+          get_video_height() {
+            local filepath="$1"
+            ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$filepath" 2>/dev/null | head -1
+          }
+
+          # Sanitize filename
+          sanitize_name() {
+            echo "$1" | tr ' ' '-' | tr '　' '-' | sed 's/--*/-/g'
+          }
+
+          # URL encode
+          urlencode() {
+            python3 -c "import urllib.parse; print(urllib.parse.quote('$1', safe=''))"
+          }
+
+          # Generate random suffix
+          random_suffix() {
+            local words=("alpha" "beta" "gamma" "delta" "epsilon" "zeta" "theta" "kappa" "lambda" "sigma" "omega" "nova" "star" "moon" "sun" "sky" "cloud" "river" "ocean" "mountain")
+            local word=${words[$((RANDOM % ${#words[@]}))]}
+            local num=$((RANDOM % 10000))
+            echo "${word}_${num}"
+          }
+
+          # Check if path exists
+          path_exists() {
+            [ -d "$1" ] || [ -f "$1" ]
+          }
+
+          # Download subtitles for a video
+          download_subtitles() {
+            local url="$1"
+            local video_name="$2"
+            local sub_dir="/tmp/subs_${video_name}"
+            local out_tmpl="${sub_dir}/%(title)s"
+
+            mkdir -p "$sub_dir"
+
+            local flags_all=("--write-sub" "--sub-langs" "fa,en")
+            local flags_auto=("--write-auto-sub" "--sub-langs" "en,fa")
+            local common=("--sub-format" "vtt/srt/best" "--convert-subs" "vtt" "--skip-download" "--no-playlist" "--no-check-certificates" "--output" "$out_tmpl")
+            local proxy=("--proxy" "socks5://127.0.0.1:1080")
+
+            # Download manual subtitles first
+            for method in {1..8}; do
+              local sub_cmd=()
+              case $method in
+                1) sub_cmd=("yt-dlp" $proxy "--extractor-args" "youtube:player_client=web" "--js-runtimes" "deno" "--remote-components" "ejs:github" ${flags_all[@]} ${common[@]} "$url") ;;
+                2) sub_cmd=("yt-dlp" $proxy "--extractor-args" "youtube:player_client=web" "--js-runtimes" "deno" "--remote-components" "ejs:npm" ${flags_all[@]} ${common[@]} "$url") ;;
+                3) sub_cmd=("yt-dlp" $proxy "--extractor-args" "youtube:player_client=web,mweb,android_vr" "--js-runtimes" "deno" "--remote-components" "ejs:github" ${flags_all[@]} ${common[@]} "$url") ;;
+                4) sub_cmd=("yt-dlp" $proxy "--extractor-args" "youtube:player_client=mweb" ${flags_all[@]} ${common[@]} "$url") ;;
+                5) sub_cmd=("yt-dlp" $proxy "--extractor-args" "youtube:player_client=android_vr" ${flags_all[@]} ${common[@]} "$url") ;;
+                6) sub_cmd=("yt-dlp" "--extractor-args" "youtube:player_client=web" "--js-runtimes" "deno" "--remote-components" "ejs:github" ${flags_all[@]} ${common[@]} "$url") ;;
+                7) sub_cmd=("yt-dlp" "--extractor-args" "youtube:player_client=mweb" ${flags_all[@]} ${common[@]} "$url") ;;
+                8) sub_cmd=("yt-dlp" $proxy "--extractor-args" "youtube:player_client=android" ${flags_all[@]} ${common[@]} "$url") ;;
+              esac
+              "${sub_cmd[@]}" 2>/dev/null || true
+
+              # Check if we got any subtitles
+              if ls "$sub_dir"/*.vtt 2>/dev/null | grep -q . || ls "$sub_dir"/*.srt 2>/dev/null | grep -q .; then
+                break
+              fi
+            done
+
+            # Check if we need auto-generated subtitles
+            local en_count=$(ls "$sub_dir"/*.en.vtt "$sub_dir"/*.en.srt 2>/dev/null | wc -l)
+            local fa_count=$(ls "$sub_dir"/*.fa.vtt "$sub_dir"/*.fa.srt 2>/dev/null | wc -l)
+
+            if [ "$en_count" -eq 0 ] || [ "$fa_count" -eq 0 ]; then
+              for method in {1..8}; do
+                local sub_cmd=()
+                case $method in
+                  1) sub_cmd=("yt-dlp" $proxy "--extractor-args" "youtube:player_client=web" "--js-runtimes" "deno" "--remote-components" "ejs:github" ${flags_auto[@]} ${common[@]} "$url") ;;
+                  2) sub_cmd=("yt-dlp" $proxy "--extractor-args" "youtube:player_client=web" "--js-runtimes" "deno" "--remote-components" "ejs:npm" ${flags_auto[@]} ${common[@]} "$url") ;;
+                  3) sub_cmd=("yt-dlp" $proxy "--extractor-args" "youtube:player_client=web,mweb,android_vr" "--js-runtimes" "deno" "--remote-components" "ejs:github" ${flags_auto[@]} ${common[@]} "$url") ;;
+                  4) sub_cmd=("yt-dlp" $proxy "--extractor-args" "youtube:player_client=mweb" ${flags_auto[@]} ${common[@]} "$url") ;;
+                  5) sub_cmd=("yt-dlp" $proxy "--extractor-args" "youtube:player_client=android_vr" ${flags_auto[@]} ${common[@]} "$url") ;;
+                  6) sub_cmd=("yt-dlp" "--extractor-args" "youtube:player_client=web" "--js-runtimes" "deno" "--remote-components" "ejs:github" ${flags_auto[@]} ${common[@]} "$url") ;;
+                  7) sub_cmd=("yt-dlp" "--extractor-args" "youtube:player_client=mweb" ${flags_auto[@]} ${common[@]} "$url") ;;
+                  8) sub_cmd=("yt-dlp" $proxy "--extractor-args" "youtube:player_client=android" ${flags_auto[@]} ${common[@]} "$url") ;;
+                esac
+                "${sub_cmd[@]}" 2>/dev/null || true
+              done
+            fi
+
+            # Check if we got any subtitles
+            local sub_count=$(ls "$sub_dir"/*.vtt "$sub_dir"/*.srt 2>/dev/null | wc -l)
+            if [ "$sub_count" -gt 0 ]; then
+              # Create zip file
+              local zip_path="/tmp/subs_${video_name}.zip"
+              (cd "$sub_dir" && zip -j "$zip_path" *.vtt *.srt 2>/dev/null) || true
+              echo "$zip_path"
+            fi
+
+            rm -rf "$sub_dir"
+          }
+
+          # Main processing
+          BACKUP_DIR="/tmp/video_backup_$$"
+          mkdir -p "$BACKUP_DIR"
+
+          # Video info for release notes
+          VIDEO_INFO_FILE="/tmp/video_info.txt"
+          > "$VIDEO_INFO_FILE"
+
+          VIDEO_INDEX=0
+          for url in "${ALL_URLS[@]}"; do
+            VIDEO_INDEX=$((VIDEO_INDEX + 1))
+            echo "Processing URL $VIDEO_INDEX: $url"
+
+            TMP_DIR="tmp_downloads_$VIDEO_INDEX"
+            mkdir -p "$TMP_DIR"
+
+            fmt=$(get_format "$YT_QUALITY")
+
+            # Download video
+            if download_video "$url" "$TMP_DIR" "$fmt" "$YT_QUALITY"; then
+              # Find downloaded video file
+              for video_file in "$TMP_DIR"/*.mp4 "$TMP_DIR"/*.mkv "$TMP_DIR"/*.webm "$TMP_DIR"/*.mp3; do
+                [ -f "$video_file" ] || continue
+
+                # Remove .part files
+                rm -f "$TMP_DIR"/*.part
+
+                # Get video info
+                video_name=$(sanitize_name "$(basename "$video_file" | sed 's/\.[^.]*$//')")
+                video_ext="${video_file##*.}"
+                video_size=$(stat -c%s "$video_file")
+                video_height=$(get_video_height "$video_file")
+
+                echo "Video: $video_name.$video_ext ($(( video_size / 1048576 )) MB)"
+
+                # Create unique folder
+                FOLDER_NAME="$video_name"
+                while path_exists "$BACKUP_DIR/$FOLDER_NAME"; do
+                  FOLDER_NAME="${video_name}_$(random_suffix)"
+                done
+
+                mkdir -p "$BACKUP_DIR/$FOLDER_NAME"
+
+                # Copy thumbnail
+                if ls "$TMP_DIR"/*.jpg 2>/dev/null | head -1 > /dev/null; then
+                  cp "$TMP_DIR"/*.jpg "$BACKUP_DIR/$FOLDER_NAME/thumbnail.jpg" 2>/dev/null || true
+                fi
+
+                # Handle large files (>2GB)
+                SPLIT_MB=95
+                SPLIT_BYTES=$((SPLIT_MB * 1024 * 1024))
+
+                if [ "$video_size" -gt "$SPLIT_BYTES" ]; then
+                  echo "Splitting large file..."
+                  if [ -n "$YT_PASSWORD" ]; then
+                    rar a -m0 "-v${SPLIT_MB}m" "-hp${YT_PASSWORD}" "$BACKUP_DIR/$FOLDER_NAME/$FOLDER_NAME.rar" "$video_file"
+                  else
+                    rar a -m0 "-v${SPLIT_MB}m" "$BACKUP_DIR/$FOLDER_NAME/$FOLDER_NAME.rar" "$video_file"
+                  fi
+                elif [ -n "$YT_PASSWORD" ]; then
+                  rar a -m0 "-hp${YT_PASSWORD}" "$BACKUP_DIR/$FOLDER_NAME/$FOLDER_NAME.rar" "$video_file"
+                else
+                  cp "$video_file" "$BACKUP_DIR/$FOLDER_NAME/$FOLDER_NAME.$video_ext"
+                fi
+
+                # Write video info
+                echo "$video_name|$FOLDER_NAME" >> "$VIDEO_INFO_FILE"
+
+                # Download subtitles if enabled
+                if [ "$DOWNLOAD_SUBS" = "true" ]; then
+                  echo "Downloading subtitles for: $video_name"
+                  sub_zip=$(download_subtitles "$url" "$video_name")
+                  if [ -n "$sub_zip" ] && [ -f "$sub_zip" ]; then
+                    cp "$sub_zip" "$BACKUP_DIR/$FOLDER_NAME/${video_name}_subs.zip"
+                    echo "Subtitles downloaded: ${video_name}_subs.zip"
+                  fi
+                fi
+
+                break
+              done
+            else
+              echo "All download methods failed for URL: $url"
+            fi
+
+            # Cleanup
+            rm -rf "$TMP_DIR"
+          done
+
+          # Save backup directory path for upload step
+          echo "$BACKUP_DIR" > /tmp/backup_dir_path.txt
+          echo "Download completed. Backup dir: $BACKUP_DIR"
+
+      - name: Stop WARP Container
+        if: always()
+        run: |
+          docker stop warp || true
+          docker rm warp || true
+
+      - name: Upload to GitHub Release
+        run: |
+          REPO_OWNER=${{ github.repository_owner }}
+          REPO_NAME=${{ github.repository.name }}
+          BACKUP_DIR=$(cat /tmp/backup_dir_path.txt)
+          VIDEO_INFO="/tmp/video_info.txt"
+
+          BACKUP_FILE_COUNT=$(find "$BACKUP_DIR" -type f 2>/dev/null | wc -l)
+          if [ "$BACKUP_FILE_COUNT" -eq 0 ]; then
+            echo "WARNING: No files downloaded"
+            exit 0
+          fi
+
+          TAG="yt-$(date +%Y%m%d-%H%M%S)"
+          echo "Creating release: $TAG"
+
+          # Initialize git repo for gh CLI
+          git init
+          git remote add origin "https://github.com/${REPO_OWNER}/${REPO_NAME}"
+
+          # Create release
+          RELEASE_TITLE="YouTube Download $(date '+%Y-%m-%d %H:%M')"
+
+          # Build release notes from video info
+          NOTES="## Downloaded Videos\n\n"
+          NUM=0
+          HAS_SUBS=false
+          if [ -f "$VIDEO_INFO" ]; then
+            while IFS='|' read -r ORIG_NAME FOLDER_NAME; do
+              NUM=$((NUM + 1))
+              NOTES="${NOTES}${NUM}. ${ORIG_NAME}\n"
+              if [ -f "$BACKUP_DIR/$FOLDER_NAME/${ORIG_NAME}_subs.zip" ]; then
+                NOTES="${NOTES}   - Subtitles: ✅\n"
+                HAS_SUBS=true
+              else
+                NOTES="${NOTES}   - Subtitles: ❌\n"
+              fi
+            done < "$VIDEO_INFO"
+          fi
+          NOTES="${NOTES}\n---\n*Downloaded with [Ourtube](https://github.com/${REPO_OWNER}/${REPO_NAME})*"
+
+          gh release create "$TAG" \
+            --title "$RELEASE_TITLE" \
+            --notes "$(echo -e "$NOTES")" \
+            --prerelease
+
+          # Upload all files from backup directory
+          echo "Uploading files to release..."
+          find "$BACKUP_DIR" -type f -not -name "README.md" | while read -r FILE; do
+            FILENAME=$(basename "$FILE")
+            echo "  Uploading: $FILENAME"
+            gh release upload "$TAG" "$FILE" --clobber
+          done
+
+          echo "=========================================="
+          echo "Release created: $TAG"
+          echo "View at: https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/tag/$TAG"
+          echo "=========================================="
